@@ -8,7 +8,9 @@
 #define TEST_Z(x)  do { if (!(x)) die("error: " #x " failed (returned zero/null)."); } while (0)
 
 const size_t BUFFER_SIZE = 1024 * 1024 * 1024 * 32l;
-const unsigned int NUM_PROCS = 8;
+//const unsigned int NUM_PROCS = 8;
+//zwsong修改 核数 修改建立队列数
+const unsigned int NUM_PROCS = 20;
 const unsigned int NUM_QUEUES_PER_PROC = 3;
 const unsigned int NUM_QUEUES = NUM_PROCS * NUM_QUEUES_PER_PROC;
 

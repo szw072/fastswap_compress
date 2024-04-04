@@ -21,12 +21,13 @@ default:
 clean:
 	$(MAKE) -C $(KDIR) M=$$PWD clean
 endif
-
+#
 obj-m  := fastswap.o
-ifeq ($(BACKEND),RDMA)
+# ifeq ($(BACKEND),RDMA) # make BACKEND=RDMA
+ifeq ($(BACKEND), ) #默认RDMA #直接make
 	obj-m += fastswap_rdma.o
 	CFLAGS_fastswap.o=-DBACKEND=2
-else
+else #指定任意参数使用DRAM
 	obj-m += fastswap_dram.o
 	CFLAGS_fastswap.o=-DBACKEND=1
 endif
