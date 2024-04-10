@@ -27,7 +27,8 @@ module_param_string(cip, clientip, INET_ADDRSTRLEN, 0644);
 // TODO: destroy ctrl
 
 #define CONNECTION_TIMEOUT_MS 60000
-#define QP_QUEUE_DEPTH 256
+// #define QP_QUEUE_DEPTH 256
+#define QP_QUEUE_DEPTH 15000
 /* we don't really use recv wrs, so any small number should do */
 #define QP_MAX_RECV_WR 4
 /* we mainly do send wrs */
@@ -73,11 +74,11 @@ static void decompress_buf_read_lzo(struct rdma_req *req){
       goto out;
     }
     memcpy(dst, req->src, req->len);
-    pr_err("[done] uncompress cpuid: %d offset: %llx crc: %hx",smp_processor_id(), req->roffset, crc_r);
+    pr_info("[done] uncompress cpuid: %d offset: %llx crc: %hx",smp_processor_id(), req->roffset, crc_r);
   }
   else{
     if(req->crc_compress != crc_r){
-      pr_err("[!!!] compress crc wrong!!! cpuid: %d offset: %llx crc write: %hx read: %hx",smp_processor_id(), req->roffset, req->crc_compress, crc_r);
+      pr_err("[!!!] decompress crc wrong!!! cpuid: %d offset: %llx crc write: %hx read: %hx",smp_processor_id(), req->roffset, req->crc_compress, crc_r);
       goto out;
     }
       
@@ -1006,7 +1007,7 @@ static inline int begin_read(struct rdma_queue *q, struct page *page,
     return ret;
   req->len = entry->length;//+++ 用于unmap
   req->roffset = roffset;//+++++
-  req->page = page;//+++
+  req->page = page;//+++ 用于done中释放 SetPageUptodate()和unlock_page()
   req->src = buf_read;//+++
   req->crc_compress = entry->crc_compress;//+++ 用于解压缩校验
   req->crc_uncompress = entry->crc_uncompress;//+++ 用于解压缩校验
