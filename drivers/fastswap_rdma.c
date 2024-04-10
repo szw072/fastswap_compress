@@ -3,6 +3,7 @@
 #include "fastswap_rdma.h"
 #include <linux/slab.h>
 #include <linux/cpumask.h>
+#include <linux/crc16.h>
 
 static struct sswap_rdma_ctrl *gctrl;
 static int serverport;
@@ -12,20 +13,31 @@ static char serverip[INET_ADDRSTRLEN];
 static char clientip[INET_ADDRSTRLEN];
 static struct kmem_cache *req_cache;
 module_param_named(sport, serverport, int, 0644);
-module_param_named(nq, numqueues, int, 0644);
+
+// modified by ysjing
+// module_param_named(nq, numqueues, int, 0644);
+module_param_named(nc, numcpus, int, 0644);
+
 module_param_string(sip, serverip, INET_ADDRSTRLEN, 0644);
 module_param_string(cip, clientip, INET_ADDRSTRLEN, 0644);
+
+
+static void *drambuf;
 
 // TODO: destroy ctrl
 
 #define CONNECTION_TIMEOUT_MS 60000
-#define QP_QUEUE_DEPTH 256
+#define QP_QUEUE_DEPTH 15000
 /* we don't really use recv wrs, so any small number should do */
 #define QP_MAX_RECV_WR 4
 /* we mainly do send wrs */
 #define QP_MAX_SEND_WR	(4096)
 #define CQ_NUM_CQES	(QP_MAX_SEND_WR)
 #define POLL_BATCH_HIGH (QP_MAX_SEND_WR / 4)
+
+#define ONEGB (1024UL*1024*1024)
+#define REMOTE_BUF_SIZE (ONEGB * 30) /* must match what server is allocating */
+#define COMPRESS_RATIO 0.5
 
 static void sswap_rdma_addone(struct ib_device *dev)
 {
@@ -426,6 +438,8 @@ static void __exit sswap_rdma_cleanup_module(void)
   if (req_cache) {
     kmem_cache_destroy(req_cache);
   }
+	vfree(drambuf);
+
 }
 
 static void sswap_rdma_write_done(struct ib_cq *cq, struct ib_wc *wc)
@@ -439,8 +453,10 @@ static void sswap_rdma_write_done(struct ib_cq *cq, struct ib_wc *wc)
     pr_err("sswap_rdma_write_done status is not success, it is=%d\n", wc->status);
     //q->write_error = wc->status;
   }
-  ib_dma_unmap_page(ibdev, req->dma, PAGE_SIZE, DMA_TO_DEVICE);
+  // ib_dma_unmap_page(ibdev, req->dma, PAGE_SIZE, DMA_TO_DEVICE);// 修改接口后这里 req->dma 是page kmap到的内核虚拟地址 
+  ib_dma_unmap_single(ibdev, req->dma, req->len, DMA_TO_DEVICE);
 
+  kfree(req->src);
   atomic_dec(&q->pending);
   kmem_cache_free(req_cache, req);
 }
@@ -455,26 +471,31 @@ static void sswap_rdma_read_done(struct ib_cq *cq, struct ib_wc *wc)
   if (unlikely(wc->status != IB_WC_SUCCESS))
     pr_err("sswap_rdma_read_done status is not success, it is=%d\n", wc->status);
 
-  ib_dma_unmap_page(ibdev, req->dma, PAGE_SIZE, DMA_FROM_DEVICE);
+  ib_dma_unmap_single(ibdev, req->dma, req->len, DMA_FROM_DEVICE);
 
-  SetPageUptodate(req->page);
-  unlock_page(req->page);
+  pr_info("[*read done] roffset: %llx", req->roffset); 
+
+  kfree(req->src);
+
+  // SetPageUptodate(req->page);
+  // unlock_page(req->page);
   complete(&req->done);
   atomic_dec(&q->pending);
-  kmem_cache_free(req_cache, req);
+  // kmem_cache_free(req_cache, req);
 }
 
 inline static int sswap_rdma_post_rdma(struct rdma_queue *q, struct rdma_req *qe,
   struct ib_sge *sge, u64 roffset, enum ib_wr_opcode op)
 {
-  struct ib_send_wr *bad_wr;
+  const struct ib_send_wr *bad_wr;
   struct ib_rdma_wr rdma_wr = {};
   int ret;
 
   BUG_ON(qe->dma == 0);
 
   sge->addr = qe->dma;
-  sge->length = PAGE_SIZE;
+  // sge->length = PAGE_SIZE;
+  sge->length = qe->len;//按照rdma_req设置长度 PAGE_SIZE --> qe->len
   sge->lkey = q->ctrl->rdev->pd->local_dma_lkey;
 
   /* TODO: add a chain of WR, we already have a list so should be easy
@@ -519,7 +540,7 @@ static void sswap_rdma_recv_remotemr_done(struct ib_cq *cq, struct ib_wc *wc)
 static int sswap_rdma_post_recv(struct rdma_queue *q, struct rdma_req *qe,
   size_t bufsize)
 {
-  struct ib_recv_wr *bad_wr;
+  const struct ib_recv_wr *bad_wr;
   struct ib_recv_wr wr = {};
   struct ib_sge sge;
   int ret;
@@ -561,7 +582,7 @@ inline static int get_req_for_page(struct rdma_req **req, struct ib_device *dev,
   (*req)->page = page;
   init_completion(&(*req)->done);
 
-  (*req)->dma = ib_dma_map_page(dev, page, 0, PAGE_SIZE, dir);
+  (*req)->dma = ib_dma_map_page(dev, page, 0, PAGE_SIZE, dir);//这里page是high memory需要使用
   if (unlikely(ib_dma_mapping_error(dev, (*req)->dma))) {
     pr_err("ib_dma_mapping_error\n");
     ret = -ENOMEM;
@@ -589,7 +610,7 @@ inline static int get_req_for_buf(struct rdma_req **req, struct ib_device *dev,
     goto out;
   }
 
-  init_completion(&(*req)->done);
+  init_completion(&(*req)->done);//++++
 
   (*req)->dma = ib_dma_map_single(dev, buf, size, dir);
   if (unlikely(ib_dma_mapping_error(dev, (*req)->dma))) {
@@ -651,31 +672,48 @@ static inline int write_queue_add(struct rdma_queue *q, struct page *page,
   struct ib_device *dev = q->ctrl->rdev->dev;
   struct ib_sge sge = {};
   int ret, inflight;
+  int wlen;
+  void *buf_write;
+  
+  wlen = PAGE_SIZE / 2;
+  buf_write = kmalloc(wlen, GFP_KERNEL);
 
   while ((inflight = atomic_read(&q->pending)) >= QP_MAX_SEND_WR - 8) {
     BUG_ON(inflight > QP_MAX_SEND_WR);
     poll_target(q, 2048);
     pr_info_ratelimited("back pressure writes");
   }
-
-  ret = get_req_for_page(&req, dev, page, DMA_TO_DEVICE);
+  //******** RDMA写 **************
+  ret = get_req_for_buf(&req, dev, buf_write, wlen, DMA_TO_DEVICE);//设置req中地址dma 长度len
   if (unlikely(ret))
     return ret;
-
+  req->len = wlen;//+++ 用于post请求设置sge
+  req->src = buf_write;
   req->cqe.done = sswap_rdma_write_done;
   ret = sswap_rdma_post_rdma(q, req, &sge, roffset, IB_WR_RDMA_WRITE);
 
   return ret;
 }
 
-static inline int begin_read(struct rdma_queue *q, struct page *page,
-			     u64 roffset)
+int dram_write(struct page *page, u64 roffset)
 {
-  struct rdma_req *req;
+	void *page_vaddr;
+
+	page_vaddr = kmap_atomic(page);
+	copy_page((void *) (drambuf + roffset), page_vaddr);
+	kunmap_atomic(page_vaddr);
+	return 0;
+}
+
+int rdma_read(struct rdma_req **req, struct rdma_queue *q, struct page *page, u64 roffset){
+  // struct rdma_req *req;
   struct ib_device *dev = q->ctrl->rdev->dev;
   struct ib_sge sge = {};
   int ret, inflight;
+  void *buf_read;
+  int rlen = PAGE_SIZE / 2;
 
+  buf_read = kmalloc(rlen, GFP_KERNEL);
   /* back pressure in-flight reads, can't send more than
    * QP_MAX_SEND_WR at a time */
   while ((inflight = atomic_read(&q->pending)) >= QP_MAX_SEND_WR) {
@@ -684,12 +722,56 @@ static inline int begin_read(struct rdma_queue *q, struct page *page,
     pr_info_ratelimited("back pressure happened on reads");
   }
 
-  ret = get_req_for_page(&req, dev, page, DMA_TO_DEVICE);
+  pr_info("[begin_read] roffset: %llx", roffset);//读输出roffset
+
+  //******** RDMA读 **************
+  buf_read = kmalloc(rlen, GFP_KERNEL);//作为read buf
+  ret = get_req_for_buf(req, dev, buf_read, rlen, DMA_FROM_DEVICE);
+
+  // ret = get_req_for_page(&req, dev, page, DMA_TO_DEVICE);
+
   if (unlikely(ret))
     return ret;
+  (*req)->roffset = roffset;//+++++ 用于done中pr_info
+  // req->page = page;//+++ 用于done中释放 SetPageUptodate()和unlock_page()
+  (*req)->src = buf_read;//+++ 用于释放
+  (*req)->len = rlen;//+++ post请求设置sge->length
+  (*req)->cqe.done = sswap_rdma_read_done;
+  ret = sswap_rdma_post_rdma(q, (*req), &sge, roffset, IB_WR_RDMA_READ);
 
-  req->cqe.done = sswap_rdma_read_done;
-  ret = sswap_rdma_post_rdma(q, req, &sge, roffset, IB_WR_RDMA_READ);
+  return ret;
+}
+
+int dram_read(struct rdma_queue *q, struct page *page, u64 roffset){
+  void *page_vaddr;
+
+	page_vaddr = kmap_atomic(page);
+	copy_page(page_vaddr, (void *) (drambuf + roffset));
+	kunmap_atomic(page_vaddr);
+  return 0;
+}
+
+static inline int begin_read(struct rdma_queue *q, struct page *page,
+			     u64 roffset)
+{
+  struct rdma_req *req;
+  int ret;
+
+
+  //******** rdma读 **************
+  rdma_read(&req, q, page, roffset);
+
+  //******** 等待read done完成 再释放page **************
+  sswap_rdma_wait_completion(q->cq, req);//等待read done完成
+  kmem_cache_free(req_cache, req);//在外面释放 wait_completion需要使用
+
+  //******** dram读 **************
+  ret = dram_read(q, page, roffset);
+
+  //******** 更新 + unlock page **************
+  SetPageUptodate(page);
+  unlock_page(page);
+
   return ret;
 }
 
@@ -700,10 +782,20 @@ int sswap_rdma_write(struct page *page, u64 roffset)
 
   VM_BUG_ON_PAGE(!PageSwapCache(page), page);
 
+  //******** rdma写 **************
   q = sswap_rdma_get_queue(smp_processor_id(), QP_WRITE_SYNC);
+  if(q == NULL){
+    BUG();
+  }
   ret = write_queue_add(q, page, roffset);
   BUG_ON(ret);
   drain_queue(q);
+
+  //******** dram写 **************
+  ret = dram_write(page, roffset);
+
+  pr_info("[write] cpuid: %d offset: %llx", smp_processor_id(), roffset);
+  
   return ret;
 }
 EXPORT_SYMBOL(sswap_rdma_write);
@@ -816,7 +908,8 @@ static int __init sswap_rdma_init_module(void)
   pr_info("start: %s\n", __FUNCTION__);
   pr_info("* RDMA BACKEND *");
 
-  numcpus = num_online_cpus();
+  // modified by ysjing
+  // numcpus = num_online_cpus(
   numqueues = numcpus * 3;
 
   req_cache = kmem_cache_create("sswap_req_cache", sizeof(struct rdma_req), 0,
@@ -841,6 +934,9 @@ static int __init sswap_rdma_init_module(void)
     ib_unregister_client(&sswap_rdma_ib_client);
     return -ENODEV;
   }
+  drambuf = vzalloc(REMOTE_BUF_SIZE);
+	pr_info("vzalloc'ed %lu bytes for dram backend\n", REMOTE_BUF_SIZE);
+
 
   pr_info("ctrl is ready for reqs\n");
   return 0;

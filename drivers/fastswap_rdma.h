@@ -28,6 +28,9 @@ struct rdma_req {
   struct ib_cqe cqe;
   u64 dma;
   struct page *page;
+  size_t len;//++++
+  u64 roffset;//+++
+  void *src;//++++
 };
 
 struct sswap_rdma_ctrl;
