@@ -23,7 +23,7 @@ clean:
 endif
 
 obj-m  := fastswap.o
-ifeq ($(BACKEND),RDMA)
+ifeq ($(BACKEND), )
 	obj-m += fastswap_rdma.o
 	CFLAGS_fastswap.o=-DBACKEND=2
 else
