@@ -12,14 +12,19 @@ static char serverip[INET_ADDRSTRLEN];
 static char clientip[INET_ADDRSTRLEN];
 static struct kmem_cache *req_cache;
 module_param_named(sport, serverport, int, 0644);
-module_param_named(nq, numqueues, int, 0644);
+
+// modified by ysjing
+// module_param_named(nq, numqueues, int, 0644);
+module_param_named(nc, numcpus, int, 0644);
+
 module_param_string(sip, serverip, INET_ADDRSTRLEN, 0644);
 module_param_string(cip, clientip, INET_ADDRSTRLEN, 0644);
 
 // TODO: destroy ctrl
 
 #define CONNECTION_TIMEOUT_MS 60000
-#define QP_QUEUE_DEPTH 256
+// #define QP_QUEUE_DEPTH 256
+#define QP_QUEUE_DEPTH 15000
 /* we don't really use recv wrs, so any small number should do */
 #define QP_MAX_RECV_WR 4
 /* we mainly do send wrs */
@@ -467,7 +472,7 @@ static void sswap_rdma_read_done(struct ib_cq *cq, struct ib_wc *wc)
 inline static int sswap_rdma_post_rdma(struct rdma_queue *q, struct rdma_req *qe,
   struct ib_sge *sge, u64 roffset, enum ib_wr_opcode op)
 {
-  struct ib_send_wr *bad_wr;
+  const struct ib_send_wr *bad_wr;
   struct ib_rdma_wr rdma_wr = {};
   int ret;
 
@@ -519,7 +524,7 @@ static void sswap_rdma_recv_remotemr_done(struct ib_cq *cq, struct ib_wc *wc)
 static int sswap_rdma_post_recv(struct rdma_queue *q, struct rdma_req *qe,
   size_t bufsize)
 {
-  struct ib_recv_wr *bad_wr;
+  const struct ib_recv_wr *bad_wr;
   struct ib_recv_wr wr = {};
   struct ib_sge sge;
   int ret;
@@ -671,11 +676,13 @@ static inline int write_queue_add(struct rdma_queue *q, struct page *page,
 static inline int begin_read(struct rdma_queue *q, struct page *page,
 			     u64 roffset)
 {
+  
   struct rdma_req *req;
   struct ib_device *dev = q->ctrl->rdev->dev;
   struct ib_sge sge = {};
   int ret, inflight;
 
+  // pr_info("[read] roffset: %llx", roffset);
   /* back pressure in-flight reads, can't send more than
    * QP_MAX_SEND_WR at a time */
   while ((inflight = atomic_read(&q->pending)) >= QP_MAX_SEND_WR) {
@@ -697,6 +704,7 @@ int sswap_rdma_write(struct page *page, u64 roffset)
 {
   int ret;
   struct rdma_queue *q;
+  // pr_info("[write] roffset: %llx", roffset);
 
   VM_BUG_ON_PAGE(!PageSwapCache(page), page);
 
@@ -816,7 +824,7 @@ static int __init sswap_rdma_init_module(void)
   pr_info("start: %s\n", __FUNCTION__);
   pr_info("* RDMA BACKEND *");
 
-  numcpus = num_online_cpus();
+
   numqueues = numcpus * 3;
 
   req_cache = kmem_cache_create("sswap_req_cache", sizeof(struct rdma_req), 0,
