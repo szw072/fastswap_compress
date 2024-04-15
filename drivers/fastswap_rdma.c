@@ -19,7 +19,7 @@ module_param_named(sport, serverport, int, 0644);
 
 // modified by ysjing
 // module_param_named(nq, numqueues, int, 0644);
-module_param_named(nc, numcpus, int, 0644);
+module_param_named(nc, numcpus, int, 0644);//numqueues = numcpus * 3 = 60;
 
 module_param_string(sip, serverip, INET_ADDRSTRLEN, 0644);
 module_param_string(cip, clientip, INET_ADDRSTRLEN, 0644);
@@ -29,6 +29,7 @@ module_param_string(cip, clientip, INET_ADDRSTRLEN, 0644);
 #define CONNECTION_TIMEOUT_MS 60000
 // #define QP_QUEUE_DEPTH 256
 #define QP_QUEUE_DEPTH 15000
+// #define QP_QUEUE_DEPTH 40000
 /* we don't really use recv wrs, so any small number should do */
 #define QP_MAX_RECV_WR 4
 /* we mainly do send wrs */
@@ -78,7 +79,7 @@ static void decompress_buf_read_lzo(struct rdma_req *req){
   }
   else{
     if(req->crc_compress != crc_r){
-      pr_err("[!!!] decompress crc wrong!!! cpuid: %d offset: %llx crc write: %hx read: %hx",smp_processor_id(), req->roffset, req->crc_compress, crc_r);
+      pr_err("[!!!] compress crc wrong!!! cpuid: %d offset: %llx crc write: %hx read: %hx",smp_processor_id(), req->roffset, req->crc_compress, crc_r);
       goto out;
     }
       
@@ -630,6 +631,7 @@ static void sswap_rdma_write_done(struct ib_cq *cq, struct ib_wc *wc)
     container_of(wc->wr_cqe, struct rdma_req, cqe);
   struct rdma_queue *q = cq->cq_context;
   struct ib_device *ibdev = q->ctrl->rdev->dev;
+  size_t page_len = PAGE_SIZE;
 
   if (unlikely(wc->status != IB_WC_SUCCESS)) {
     pr_err("sswap_rdma_write_done status is not success, it is=%d\n", wc->status);
@@ -638,7 +640,13 @@ static void sswap_rdma_write_done(struct ib_cq *cq, struct ib_wc *wc)
   // ib_dma_unmap_page(ibdev, req->dma, PAGE_SIZE, DMA_TO_DEVICE);// 修改接口后这里 req->dma 是page kmap到的内核虚拟地址 
   ib_dma_unmap_single(ibdev, req->dma, req->len, DMA_TO_DEVICE);
 
+  pr_info("[write done] cpuid: %d offset: %llx len: %zu --> %zu crc: %hx --> %hx", smp_processor_id(), req->roffset, page_len, req->len, req->crc_uncompress, req->crc_compress);
+
+  complete(&req->done);//添加写同步
+
+
   atomic_dec(&q->pending);
+  kfree(req->src);//释放write buf
   kmem_cache_free(req_cache, req);
 }
 
@@ -906,7 +914,7 @@ static inline int write_queue_add(struct rdma_queue *q, struct page *page,
   }
   kunmap_atomic(src);
 
-  pr_info("[write] cpuid: %d offset: %llx len: %zu --> %zu crc: %hx --> %hx ret: %d", smp_processor_id(), roffset, page_len, wlen, crc_uncompress, crc_compress, ret);
+//   pr_info("[write] cpuid: %d offset: %llx len: %zu --> %zu crc: %hx --> %hx ret: %d", smp_processor_id(), roffset, page_len, wlen, crc_uncompress, crc_compress, ret);
 
   ret = get_req_for_buf(&req, dev, buf_write, wlen, DMA_TO_DEVICE);//设置req中地址dma 长度len
 
@@ -922,7 +930,8 @@ static inline int write_queue_add(struct rdma_queue *q, struct page *page,
 
   // sswap_rdma_wait_completion(q->cq, req);//+++++++同步 等待写完成
 
-  //TODO 这里可能有问题 rb tree插入在post请求之后执行 可能存在写未完成 rb tree已经插入 但是应该问题不大 因为不在done中unlock page应该不会发起读请求
+  //TODO 这里可能有问题 rb tree插入在post请求之后执行 可能存在写未完成 rb tree已经插入 导致读的时候rb tree可以找到entry 但是write还处于inflight状态
+  //  但是应该问题不大 因为不在done中unlock page应该不会发起读请求
   //******** 插入rb tree **************
   entry = kmalloc(sizeof(struct zswap_entry), GFP_KERNEL); //申请插入rbtree 的swap entry
   if(entry == NULL){
@@ -939,7 +948,7 @@ static inline int write_queue_add(struct rdma_queue *q, struct page *page,
 	do {
 		ret = zswap_rb_insert(&tree->rbroot, entry, &dupentry);
 		if (ret == -EEXIST) {//重复的entry 应该删除重复的entry(dupentry)
-      pr_info("[Write_duplicate] offset: %lx", entry->offset);
+      pr_info("[write_duplicate] offset: %lx", entry->offset);
 			// zswap_duplicate_entry++;
 			/* remove from rbtree */
 			zswap_rb_erase(&tree->rbroot, dupentry);
@@ -971,7 +980,7 @@ static inline int begin_read(struct rdma_queue *q, struct page *page,
 
 
 
-  pr_info("[begin_read] roffset: %llx", roffset);//读输出roffset
+  // pr_info("[begin_read] roffset: %llx", roffset);//读输出roffset
   /* back pressure in-flight reads, can't send more than
    * QP_MAX_SEND_WR at a time */
   while ((inflight = atomic_read(&q->pending)) >= QP_MAX_SEND_WR) {
@@ -1007,14 +1016,14 @@ static inline int begin_read(struct rdma_queue *q, struct page *page,
     return ret;
   req->len = entry->length;//+++ 用于unmap
   req->roffset = roffset;//+++++
-  req->page = page;//+++ 用于done中释放 SetPageUptodate()和unlock_page()
+  req->page = page;//+++
   req->src = buf_read;//+++
   req->crc_compress = entry->crc_compress;//+++ 用于解压缩校验
   req->crc_uncompress = entry->crc_uncompress;//+++ 用于解压缩校验
   req->cqe.done = sswap_rdma_read_done;
   ret = sswap_rdma_post_rdma(q, req, &sge, roffset, IB_WR_RDMA_READ);
 
-  // sswap_rdma_wait_completion(q->cq, req);//等待read done完成
+  // sswap_rdma_wait_completion(q->cq, req);//等待read done完成 这里解压缩移到read_done中 不需要同步
 
   //******** 解压缩 lzo **************
   // decompress_buf_read_lzo(req);
@@ -1150,7 +1159,7 @@ static int __init sswap_rdma_init_module(void)
   pr_info("* RDMA BACKEND *");
 
   // modified by ysjing
-  // numcpus = num_online_cpus(
+  // numcpus = num_online_cpus()
   numqueues = numcpus * 3;
 
   req_cache = kmem_cache_create("sswap_req_cache", sizeof(struct rdma_req), 0,
