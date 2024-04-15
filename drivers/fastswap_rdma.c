@@ -75,7 +75,7 @@ static void decompress_buf_read_lzo(struct rdma_req *req){
       goto out;
     }
     memcpy(dst, req->src, req->len);
-    pr_info("[done] uncompress cpuid: %d offset: %llx crc: %hx",smp_processor_id(), req->roffset, crc_r);
+    // pr_info("[done] uncompress cpuid: %d offset: %llx crc: %hx",smp_processor_id(), req->roffset, crc_r);
   }
   else{
     if(req->crc_compress != crc_r){
@@ -93,8 +93,8 @@ static void decompress_buf_read_lzo(struct rdma_req *req){
       goto out;
     }
     crc_r_decompress = crc16(0x0000, dst, page_len);
-    pr_info("[*read done] decompress cpuid: %d offset: %llx len: %zu --> %zu ret: %d", smp_processor_id(), req->roffset, req->len, page_len, ret);
-    pr_info("[----------] crc: %hx --> %hx | %hx --> %hx", req->crc_uncompress, req->crc_compress, crc_r, crc_r_decompress);
+    // pr_info("[*read done] decompress cpuid: %d offset: %llx len: %zu --> %zu ret: %d", smp_processor_id(), req->roffset, req->len, page_len, ret);
+    // pr_info("[----------] crc: %hx --> %hx | %hx --> %hx", req->crc_uncompress, req->crc_compress, crc_r, crc_r_decompress);
   }
 out:
   kunmap_atomic(dst);
@@ -640,7 +640,7 @@ static void sswap_rdma_write_done(struct ib_cq *cq, struct ib_wc *wc)
   // ib_dma_unmap_page(ibdev, req->dma, PAGE_SIZE, DMA_TO_DEVICE);// 修改接口后这里 req->dma 是page kmap到的内核虚拟地址 
   ib_dma_unmap_single(ibdev, req->dma, req->len, DMA_TO_DEVICE);
 
-  pr_info("[write done] cpuid: %d offset: %llx len: %zu --> %zu crc: %hx --> %hx", smp_processor_id(), req->roffset, page_len, req->len, req->crc_uncompress, req->crc_compress);
+  // pr_info("[write done] cpuid: %d offset: %llx len: %zu --> %zu crc: %hx --> %hx", smp_processor_id(), req->roffset, page_len, req->len, req->crc_uncompress, req->crc_compress);
 
   complete(&req->done);//添加写同步
 
@@ -948,7 +948,7 @@ static inline int write_queue_add(struct rdma_queue *q, struct page *page,
 	do {
 		ret = zswap_rb_insert(&tree->rbroot, entry, &dupentry);
 		if (ret == -EEXIST) {//重复的entry 应该删除重复的entry(dupentry)
-      pr_info("[write_duplicate] offset: %lx", entry->offset);
+      // pr_info("[write_duplicate] offset: %lx", entry->offset);
 			// zswap_duplicate_entry++;
 			/* remove from rbtree */
 			zswap_rb_erase(&tree->rbroot, dupentry);
@@ -1000,7 +1000,7 @@ static inline int begin_read(struct rdma_queue *q, struct page *page,
 		return -1;
 	}
 	spin_unlock(&tree->lock);//unlock
-  pr_info("found rbtree entry roffest: %lx, length: %d --> %zu crc: %hx --> %hx", entry->offset, 4096, entry->length, entry->crc_uncompress, entry->crc_compress);
+  // pr_info("found rbtree entry roffest: %lx, length: %d --> %zu crc: %hx --> %hx", entry->offset, 4096, entry->length, entry->crc_uncompress, entry->crc_compress);
 
   // src = (u8 *)kmap_atomic(page);
   buf_read = kmalloc(PAGE_SIZE, GFP_KERNEL);//作为read buf
