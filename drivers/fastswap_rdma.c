@@ -473,7 +473,7 @@ static void sswap_rdma_read_done(struct ib_cq *cq, struct ib_wc *wc)
 
   ib_dma_unmap_single(ibdev, req->dma, req->len, DMA_FROM_DEVICE);
 
-  pr_info("[*read done] roffset: %llx", req->roffset); 
+  // pr_info("[*read done] roffset: %llx", req->roffset); 
 
   kfree(req->src);
 
@@ -481,7 +481,7 @@ static void sswap_rdma_read_done(struct ib_cq *cq, struct ib_wc *wc)
   // unlock_page(req->page);
   complete(&req->done);
   atomic_dec(&q->pending);
-  // kmem_cache_free(req_cache, req);
+  // kmem_cache_free(req_cache, req);//需要获取req->done 外部释放
 }
 
 inline static int sswap_rdma_post_rdma(struct rdma_queue *q, struct rdma_req *qe,
@@ -688,7 +688,7 @@ static inline int write_queue_add(struct rdma_queue *q, struct page *page,
   if (unlikely(ret))
     return ret;
   req->len = wlen;//+++ 用于post请求设置sge
-  req->src = buf_write;
+  req->src = buf_write;//+++
   req->cqe.done = sswap_rdma_write_done;
   ret = sswap_rdma_post_rdma(q, req, &sge, roffset, IB_WR_RDMA_WRITE);
 
@@ -713,7 +713,7 @@ int rdma_read(struct rdma_req **req, struct rdma_queue *q, struct page *page, u6
   void *buf_read;
   int rlen = PAGE_SIZE / 2;
 
-  buf_read = kmalloc(rlen, GFP_KERNEL);
+
   /* back pressure in-flight reads, can't send more than
    * QP_MAX_SEND_WR at a time */
   while ((inflight = atomic_read(&q->pending)) >= QP_MAX_SEND_WR) {
@@ -722,7 +722,7 @@ int rdma_read(struct rdma_req **req, struct rdma_queue *q, struct page *page, u6
     pr_info_ratelimited("back pressure happened on reads");
   }
 
-  pr_info("[begin_read] roffset: %llx", roffset);//读输出roffset
+  // pr_info("[begin_read] roffset: %llx", roffset);//读输出roffset
 
   //******** RDMA读 **************
   buf_read = kmalloc(rlen, GFP_KERNEL);//作为read buf
@@ -761,12 +761,12 @@ static inline int begin_read(struct rdma_queue *q, struct page *page,
   //******** rdma读 **************
   rdma_read(&req, q, page, roffset);
 
-  //******** 等待read done完成 再释放page **************
-  sswap_rdma_wait_completion(q->cq, req);//等待read done完成
-  kmem_cache_free(req_cache, req);//在外面释放 wait_completion需要使用
-
   //******** dram读 **************
-  ret = dram_read(q, page, roffset);
+  ret = dram_read(q, page, roffset);//rdma读请求后 接dram读
+
+  //******** 同步操作 等待read done完成 再释放page **************
+  sswap_rdma_wait_completion(q->cq, req);//等待read done完成
+  kmem_cache_free(req_cache, req);//read_done中 移到在外面释放 wait_completion需要使用
 
   //******** 更新 + unlock page **************
   SetPageUptodate(page);
@@ -794,7 +794,7 @@ int sswap_rdma_write(struct page *page, u64 roffset)
   //******** dram写 **************
   ret = dram_write(page, roffset);
 
-  pr_info("[write] cpuid: %d offset: %llx", smp_processor_id(), roffset);
+  // pr_info("[write] cpuid: %d offset: %llx", smp_processor_id(), roffset);
   
   return ret;
 }
