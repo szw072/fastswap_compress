@@ -1,0 +1,235 @@
+From dcb836321d7fd7b49a8909a8de9daf4f3e0e21e2 Mon Sep 17 00:00:00 2001
+From: zwsong <1072860370@qq.com>
+Date: Sun, 19 May 2024 15:32:13 +0800
+Subject: [PATCH 2/2] =?UTF-8?q?smartcompress=20=E5=8A=A8=E6=80=81=E8=A7=A3?=
+ =?UTF-8?q?=E5=8E=8B=E7=BC=A9=20=E6=90=AD=E9=85=8Ddrambackend=E6=B5=8B?=
+ =?UTF-8?q?=E8=AF=951000MB=20ratio=3D0.3=E9=80=9A=E8=BF=87=20=E5=8C=85?=
+ =?UTF-8?q?=E5=90=AB:=201)=E7=A6=81=E7=94=A8vma=5Freadahead=202)struct=20p?=
+ =?UTF-8?q?age=E6=B7=BB=E5=8A=A0len=E5=92=8Cundecompressed=E5=AD=97?=
+ =?UTF-8?q?=E6=AE=B5=203)=E8=A7=A3=E5=8E=8B=E7=BC=A9=E5=88=A4=E6=96=AD?=
+ =?UTF-8?q?=E5=92=8C=E5=87=BD=E6=95=B0=204)enum=20pageflags=20=E4=B8=ADPG?=
+ =?UTF-8?q?=5Fundecompressed(=E6=9C=AA=E4=BD=BF=E7=94=A8=20=E4=BD=BF?=
+ =?UTF-8?q?=E7=94=A8clear=E6=96=B9=E6=B3=95=E5=87=BA=E7=8E=B0=E5=BC=82?=
+ =?UTF-8?q?=E5=B8=B8=E9=94=99=E8=AF=AF)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ include/linux/mm_types.h   |  2 ++
+ include/linux/page-flags.h | 44 +++++++++++++++++++++++-
+ mm/memory.c                | 69 +++++++++++++++++++++++++++++++-------
+ 3 files changed, 101 insertions(+), 14 deletions(-)
+
+diff --git a/include/linux/mm_types.h b/include/linux/mm_types.h
+index cfd0ac4e5..f353a4547 100644
+--- a/include/linux/mm_types.h
++++ b/include/linux/mm_types.h
+@@ -212,6 +212,8 @@ struct page {
+ #ifdef LAST_CPUPID_NOT_IN_PAGE_FLAGS
+ 	int _last_cpupid;
+ #endif
++	short len;//记录page长度 用于解压缩
++	bool undecompressed;
+ }
+ /*
+  * The struct page can be forced to be double word aligned so that atomic ops
+diff --git a/include/linux/page-flags.h b/include/linux/page-flags.h
+index 3ec44e27a..c508a5101 100644
+--- a/include/linux/page-flags.h
++++ b/include/linux/page-flags.h
+@@ -136,6 +136,9 @@ enum pageflags {
+ 
+ 	/* non-lru isolated movable page */
+ 	PG_isolated = PG_reclaim,
++
++	/* page is undecompressed  需要解压缩 */
++	PG_undecompressed,//未使用
+ };
+ 
+ #ifndef __GENERATING_BOUNDS_H
+@@ -466,12 +469,51 @@ static __always_inline void SetPageUptodate(struct page *page)
+ 	 * so that all previous stores issued in order to bring the page
+ 	 * uptodate are actually visible before PageUptodate becomes true.
+ 	 */
+-	smp_wmb();
++	smp_wmb();//barrier()
+ 	set_bit(PG_uptodate, &page->flags);
+ }
+ 
+ CLEARPAGEFLAG(Uptodate, uptodate, PF_NO_TAIL)
+ 
++
++static inline int PageUndecompress(struct page *page)
++{
++	int ret;
++	page = compound_head(page);
++	ret = test_bit(PG_undecompressed, &(page)->flags);//test_bit(nr, addr) 返回addr所指对象第nr位
++	/*
++	 * Must ensure that the data we read out of the page is loaded
++	 * _after_ we've loaded page->flags to check for PageUptodate.
++	 * We can skip the barrier if the page is not uptodate, because
++	 * we wouldn't be reading anything from it.
++	 *
++	 * See SetPageUptodate() for the other side of the story.
++	 */
++	if (ret)
++		smp_rmb();//barrier()
++
++	return ret;
++}
++
++//区别#define SETPAGEFLAG(uname, lname, policy) 多smp_wmb()
++static __always_inline void SetPageUndecompress(struct page *page) 
++{
++	VM_BUG_ON_PAGE(PageTail(page), page);
++	smp_wmb();////不同处理器可能存在多个set_bit 存在cache 互相不可见 设置内存屏障 告诉编译器和处理器 这个点之前的写 必须要在这个点之后写 之前完成
++	set_bit(PG_undecompressed, &page->flags);//第PG_undecompressed位置1
++}
++
++// #define CLEARPAGEFLAG(uname, lname, policy)				
++// static __always_inline void ClearPage##uname(struct page *page)		
++// 	{ clear_bit(PG_##lname, &policy(page, 1)->flags); }
++
++// #define PF_NO_TAIL(page, enforce) ({					
++// 		VM_BUG_ON_PGFLAGS(enforce && PageTail(page), page);	
++// 		compound_head(page);})
++//ClearPageUndecompressed(){clear_bit(PG_undecompressed, &PF_NO_TAIL(page, 1)->flags);}
++CLEARPAGEFLAG(Undecompressed, undecompressed, PF_NO_TAIL)
++__CLEARPAGEFLAG(Undecompressed, undecompressed, PF_NO_TAIL)
++
+ int test_clear_page_writeback(struct page *page);
+ int __test_set_page_writeback(struct page *page, bool keep_write);
+ 
+diff --git a/mm/memory.c b/mm/memory.c
+index 488249916..1510131af 100644
+--- a/mm/memory.c
++++ b/mm/memory.c
+@@ -81,6 +81,11 @@
+ #include <asm/tlb.h>
+ #include <asm/tlbflush.h>
+ #include <asm/pgtable.h>
++#include <linux/lzo.h>
++#include <linux/slab.h>
++#include <linux/highmem.h>
++#include <linux/page-flags.h>
++
+ 
+ #include "internal.h"
+ 
+@@ -120,6 +125,29 @@ int randomize_va_space __read_mostly =
+ 					2;
+ #endif
+ 
++static void decompress_page_lzo(struct page *page){
++	void *page_vaddr, *buf;
++	int ret;
++	size_t page_len = PAGE_SIZE;
++
++	page_vaddr = kmap_atomic(page);
++	buf = kmalloc(page_len, GFP_KERNEL);
++	if(buf == NULL){
++		pr_err("kmalloc wrong!!!");
++		BUG();
++  	}
++	// pr_info("[kernel] decompress len: %hd", page->len);
++	//page_vaddr --decomp--> buf --mcpy--> page_vaddr
++	ret = lzo1x_decompress_safe(page_vaddr, (size_t)page->len, buf, &page_len); //解压缩到buf
++	if(ret != 0){
++		pr_err("[kernel] decompress wrong!!! ret: %d, pagelen: %hd", ret, page->len);
++		BUG();
++	}
++	memcpy(page_vaddr, buf, page_len);//buf --> page_vaddr
++	kunmap_atomic(page_vaddr);
++	kfree(buf);
++}
++
+ static int __init disable_randmaps(char *s)
+ {
+ 	randomize_va_space = 0;
+@@ -2858,10 +2886,11 @@ int do_swap_page(struct vm_fault *vmf)
+ 	int locked;
+ 	int exclusive = 0;
+ 	int ret = 0;
+-	bool vma_readahead = swap_use_vma_readahead();
++	// bool vma_readahead = swap_use_vma_readahead();//虚拟地址readahead
++	bool vma_readahead = false;//+++禁止vma readahead
+ 
+ 	if (vma_readahead) {
+-		page = swap_readahead_detect(vmf, &swap_ra);
++		page = swap_readahead_detect(vmf, &swap_ra);//return NULL;
+ 		swapcache = page;
+ 	}
+ 
+@@ -2896,36 +2925,37 @@ int do_swap_page(struct vm_fault *vmf)
+ 
+ 	delayacct_set_flag(DELAYACCT_PF_SWAPIN);
+ 	if (!page) {
+-		page = lookup_swap_cache(entry, vma_readahead ? vma : NULL,
++		page = lookup_swap_cache(entry, vma_readahead ? vma : NULL,//查swapcache
+ 					 vmf->address);
+ 		swapcache = page;
+ 	}
+ 
+-	if (!page) {
++	if (!page) {//不在swapcache中  需要swapin
+ 		struct swap_info_struct *si = swp_swap_info(entry);
+-
++		//******** zram性能优化 **************
+ 		if (si->flags & SWP_SYNCHRONOUS_IO &&
+ 				__swap_count(si, entry) == 1) {
+-			/* skip swapcache */
+-			page = alloc_page_vma(GFP_HIGHUSER_MOVABLE, vma, vmf->address);
+-			if (page) {
+-				__SetPageLocked(page);
++			/* skip swapcache 跳过查swap cache 直接读swap_readpage */
++			page = alloc_page_vma(GFP_HIGHUSER_MOVABLE, vma, vmf->address);//新分配page
++			if (page) {//成功分配
++				__SetPageLocked(page);//PG_locked 表示要page要进行IO操作
+ 				__SetPageSwapBacked(page);
+ 				set_page_private(page, entry.val);
+ 				lru_cache_add_anon(page);
+-				swap_readpage(page, true);
++				swap_readpage(page, true);//1)frontswap 2)bio [page_io.c]
+ 			}
+ 		} else {
+-			if (vma_readahead)
++		//******** 正常情况 **************
++			if (vma_readahead)//vma虚拟地址 based readahead 加载缺页地址pte周围物理page加载到swap cache
+ 				page = do_swap_page_readahead(entry,
+ 					GFP_HIGHUSER_MOVABLE, vmf, &swap_ra);
+ 			else
+-				page = swapin_readahead(entry,
++				page = swapin_readahead(entry,//物理地址readahead 包含读swap cache和demand和preftch page
+ 				       GFP_HIGHUSER_MOVABLE, vma, vmf->address);
+ 			swapcache = page;
+ 		}
+ 
+-		if (!page) {
++		if (!page) {//其他内核路径 fault此paeg
+ 			/*
+ 			 * Back out if somebody else faulted in this pte
+ 			 * while we released the pte lock.
+@@ -2953,6 +2983,19 @@ int do_swap_page(struct vm_fault *vmf)
+ 		goto out_release;
+ 	}
+ 
++	//判断是否解压缩
++	// if(PageUndecompress(page)){//需要解压缩 testbit()第PG_undecompressed位
++	// 	pr_info("try to decompress");
++	// 	// decompress_page_lzo(page);
++	// }
++
++	// ClearPageUndecompressed(page);//清理page->flags第PG_undecompressed位
++
++	if(page->undecompressed){
++		decompress_page_lzo(page);
++	}
++	page->undecompressed = false;
++
+ 	locked = lock_page_or_retry(page, vma->vm_mm, vmf->flags);
+ 
+ 	delayacct_clear_flag(DELAYACCT_PF_SWAPIN);
+-- 
+2.45.1
+
