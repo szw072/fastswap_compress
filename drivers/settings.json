@@ -1,0 +1,6 @@
+{
+    "files.associations": {
+        "Makefile": "cpp",
+        "fastswap_rdma.h": "c"
+    }
+}

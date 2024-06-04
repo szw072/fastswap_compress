@@ -898,17 +898,15 @@ static inline int write_queue_add(struct rdma_queue *q, struct page *page,
   //******** 压缩 **************
   ret = lzo1x_1_compress(src, page_len, compress_buf, &wlen, wrkmem);
 
-  crc_compress = crc16(0x0000, compress_buf, wlen);
-
-
-
   if(wlen >= 4096){//不能压缩 使用原page
+    crc_compress = crc_uncompress;//不能压缩crc_compress使用crc_uncompress
     kfree(compress_buf);
     memcpy(uncompress_buf, src, PAGE_SIZE);
     buf_write = uncompress_buf;
     wlen = page_len;
   }
   else{//能压缩 使用压缩后数据
+    crc_compress = crc16(0x0000, compress_buf, wlen);
     kfree(uncompress_buf);
     buf_write = compress_buf;
   }
