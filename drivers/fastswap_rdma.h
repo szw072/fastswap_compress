@@ -32,6 +32,7 @@ struct rdma_req {
   u64 roffset;//+++
   size_t len;//++++
   u16 crc_uncompress, crc_compress;//++++
+  ktime_t start_time;//++
 };
 
 struct sswap_rdma_ctrl;

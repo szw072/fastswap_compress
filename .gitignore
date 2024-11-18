@@ -8,3 +8,5 @@
 *.pyc
 modules.order
 Module.symvers
+drivers/.gitignore
+.gitignore

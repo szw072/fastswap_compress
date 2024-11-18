@@ -1,0 +1,4 @@
+重启网卡
+sudo systemctl restart opensm
+ibstat
+

@@ -7,6 +7,7 @@
 
 #include <linux/rbtree.h>
 #include <linux/lzo.h>
+#include <linux/lz4.h>
 
 static struct sswap_rdma_ctrl *gctrl;
 static int serverport;
@@ -53,6 +54,14 @@ static struct zswap_tree *zswap_trees;//rb tree数组,只一个swap area,申请�
 
 // static atomic_t local_stored_pages = ATOMIC_INIT(0);//未压缩成功存到本地dram数量
 static atomic_t zswap_stored_pages = ATOMIC_INIT(0);//存到页面数量
+static atomic64_t read_count = ATOMIC_INIT(0);
+static atomic64_t write_count = ATOMIC_INIT(0);
+static atomic64_t total_compress_len = ATOMIC_INIT(0);
+static atomic64_t total_compress_time = ATOMIC_INIT(0);
+static atomic64_t total_decompress_time = ATOMIC_INIT(0);
+static atomic64_t total_rdmaread_time = ATOMIC_INIT(0);
+
+
 
 /*********************************
 * lzo decompress functions
@@ -61,8 +70,9 @@ static atomic_t zswap_stored_pages = ATOMIC_INIT(0);//存到页面数量
 static void decompress_buf_read_lzo(struct rdma_req *req){
   u16 crc_r, crc_r_decompress;
   void *dst;
-  int ret;
   size_t page_len = PAGE_SIZE;
+  int decompresslen;
+  ktime_t start, diff;
 
   dst = kmap_atomic(req->page);
   crc_r = crc16(0x0000 ,req->src, req->len);
@@ -71,7 +81,7 @@ static void decompress_buf_read_lzo(struct rdma_req *req){
 
   if(req->len == 4096){
     if(req->crc_uncompress != crc_r){
-      pr_err("[!!!] uncompress crc wrong!!! cpuid: %d offset: %llx crc write: %hx read: %hx",smp_processor_id(), req->roffset, req->crc_uncompress, crc_r);
+      pr_err("[!!!] read uncompressed page wrong!!! cpuid: %d offset: %llx crc write: %hx read: %hx",smp_processor_id(), req->roffset, req->crc_uncompress, crc_r);
       goto out;
     }
     memcpy(dst, req->src, req->len);
@@ -79,20 +89,30 @@ static void decompress_buf_read_lzo(struct rdma_req *req){
   }
   else{
     if(req->crc_compress != crc_r){
-      pr_err("[!!!] compress crc wrong!!! cpuid: %d offset: %llx crc write: %hx read: %hx",smp_processor_id(), req->roffset, req->crc_compress, crc_r);
+      pr_err("[!!!] read compressed page wrong!!! cpuid: %d offset: %llx crc write: %hx read: %hx",smp_processor_id(), req->roffset, req->crc_compress, crc_r);
       goto out;
     }
       
     // decompress_ret = crypto_comp_decompress(tfm, req->src, req->len, dst, &slen);
     
-    ret = lzo1x_decompress_safe(req->src, req->len, dst, &page_len); 
+    start = ktime_get();
+    // lzo1x_decompress_safe(req->src, req->len, dst, &page_len); 
+    decompresslen = LZ4_decompress_safe(req->src, dst, req->len, PAGE_SIZE);
+
+    diff = ktime_sub(ktime_get(), start);
 
 
-    if(ret != 0){
-      pr_err("[done back] decompress wrong!!! ret: %d", ret);
-      goto out;
-    }
+
+    //******** 统计 **************
+    atomic64_inc(&read_count);
+    atomic64_set(&total_decompress_time, atomic64_read(&total_decompress_time) + ktime_to_ns(diff));
+
+
     crc_r_decompress = crc16(0x0000, dst, page_len);
+
+    if(crc_r_decompress != req->crc_uncompress){
+      pr_err("[!!!] decompress wrong!!! cpuid: %d offset: %llx crc write: %hx decomress page crc: %hx decompress len: %d",smp_processor_id(), req->roffset, req->crc_uncompress, crc_r_decompress, decompresslen);
+    }
     // pr_info("[*read done] decompress cpuid: %d offset: %llx len: %zu --> %zu ret: %d", smp_processor_id(), req->roffset, req->len, page_len, ret);
     // pr_info("[----------] crc: %hx --> %hx | %hx --> %hx", req->crc_uncompress, req->crc_compress, crc_r, crc_r_decompress);
   }
@@ -615,6 +635,11 @@ static int sswap_rdma_create_ctrl(struct sswap_rdma_ctrl **c)
 
 static void __exit sswap_rdma_cleanup_module(void)
 {
+  pr_info("--------------------------------------");
+  pr_info("write count: %ld total compress len: %ld total compress time: %ld ", atomic64_read(&write_count), atomic64_read(&total_compress_len), atomic64_read(&total_compress_time));
+  pr_info("read count: %ld total decompress time: %ld total rdma read time: %ld", atomic64_read(&read_count), atomic64_read(&total_decompress_time), atomic64_read(&total_rdmaread_time));
+  pr_info("--------------------------------------");
+
   sswap_rdma_stopandfree_queues(gctrl);
   ib_unregister_client(&sswap_rdma_ib_client);
   kfree(gctrl);
@@ -631,7 +656,6 @@ static void sswap_rdma_write_done(struct ib_cq *cq, struct ib_wc *wc)
     container_of(wc->wr_cqe, struct rdma_req, cqe);
   struct rdma_queue *q = cq->cq_context;
   struct ib_device *ibdev = q->ctrl->rdev->dev;
-  size_t page_len = PAGE_SIZE;
 
   if (unlikely(wc->status != IB_WC_SUCCESS)) {
     pr_err("sswap_rdma_write_done status is not success, it is=%d\n", wc->status);
@@ -656,12 +680,19 @@ static void sswap_rdma_read_done(struct ib_cq *cq, struct ib_wc *wc)
     container_of(wc->wr_cqe, struct rdma_req, cqe);
   struct rdma_queue *q = cq->cq_context;
   struct ib_device *ibdev = q->ctrl->rdev->dev;
+  ktime_t diff;
 
 
 
   if (unlikely(wc->status != IB_WC_SUCCESS))
     pr_err("sswap_rdma_read_done status is not success, it is=%d\n", wc->status);
 
+  diff = ktime_sub(ktime_get(), req->start_time);
+
+  //******** 统计 **************
+  atomic64_set(&total_rdmaread_time, atomic64_read(&total_rdmaread_time) + ktime_to_ns(diff));
+  
+  
   ib_dma_unmap_single(ibdev, req->dma, req->len, DMA_FROM_DEVICE);
   decompress_buf_read_lzo(req);
 
@@ -856,6 +887,33 @@ static inline int drain_queue(struct rdma_queue *q)
   return 1;
 }
 
+int compress_lz4(const char *src, char *dst, int inputSize, int maxOutputSize){
+  void *wrkmem_lz4;
+  int wlen;
+
+  wrkmem_lz4 = kmalloc(LZ4_MEM_COMPRESS, GFP_KERNEL);
+
+  wlen =  LZ4_compress_default(src, dst, inputSize, maxOutputSize, wrkmem_lz4);
+
+  kfree(wrkmem_lz4);
+  return wlen;
+}
+
+
+int compress_lzo(const char *src, char *dst, int inputSize, int maxOutputSize){
+  void *wrkmem_lzo;
+  size_t wlen;
+
+  wrkmem_lzo = kmalloc(LZO1X_1_MEM_COMPRESS, GFP_KERNEL);
+
+  lzo1x_1_compress(src, inputSize, dst, &wlen, wrkmem_lzo);
+
+  kfree(wrkmem_lzo);
+  return wlen;
+}
+
+
+
 static inline int write_queue_add(struct rdma_queue *q, struct page *page,
 				  u64 roffset)
 {
@@ -871,9 +929,7 @@ static inline int write_queue_add(struct rdma_queue *q, struct page *page,
   struct zswap_tree *tree = zswap_trees;//每个swap area对应一个rb树 这里只使用一个
   struct zswap_entry *entry = NULL, *dupentry;
 
-  void *wrkmem;
-
-  wrkmem = kmalloc(LZO1X_1_MEM_COMPRESS, GFP_KERNEL);
+  ktime_t start, diff;
 
 
   while ((inflight = atomic_read(&q->pending)) >= QP_MAX_SEND_WR - 8) {
@@ -896,7 +952,18 @@ static inline int write_queue_add(struct rdma_queue *q, struct page *page,
   crc_uncompress = crc16(0x0000, src, page_len);
 
   //******** 压缩 **************
-  ret = lzo1x_1_compress(src, page_len, compress_buf, &wlen, wrkmem);
+  /* 1. 获取当前时间 */
+  start = ktime_get();
+
+  // ret = lzo1x_1_compress(src, page_len, compress_buf, &wlen, wrkmem);
+  // wlen =  LZ4_compress_default(src, compress_buf, PAGE_SIZE, 2 * PAGE_SIZE, wrkmem_lz4);
+  wlen = compress_lz4(src, compress_buf, PAGE_SIZE, 2 * PAGE_SIZE);
+  // wlen  = compress_lzo(src, compress_buf, PAGE_SIZE, 2 * PAGE_SIZE);
+
+  /* 2. 计算时间差，单位纳秒 */
+  diff = ktime_sub(ktime_get(), start);
+  // printk("2diff time = %lldns\n", ktime_to_ns(diff));
+  
 
   crc_compress = crc16(0x0000, compress_buf, wlen);
 
@@ -913,6 +980,11 @@ static inline int write_queue_add(struct rdma_queue *q, struct page *page,
     buf_write = compress_buf;
   }
   kunmap_atomic(src);
+
+    //******** 统计 **************
+  atomic64_inc(&write_count);
+  atomic64_set(&total_compress_len, atomic64_read(&total_compress_len) + wlen);
+  atomic64_set(&total_compress_time, atomic64_read(&total_compress_time) + ktime_to_ns(diff));
 
 //   pr_info("[write] cpuid: %d offset: %llx len: %zu --> %zu crc: %hx --> %hx ret: %d", smp_processor_id(), roffset, page_len, wlen, crc_uncompress, crc_compress, ret);
 
@@ -958,7 +1030,7 @@ static inline int write_queue_add(struct rdma_queue *q, struct page *page,
 	} while (ret == -EEXIST);
   spin_unlock(&tree->lock);
 
-  kfree(wrkmem);
+
   return ret;
 }
 
@@ -1021,17 +1093,12 @@ static inline int begin_read(struct rdma_queue *q, struct page *page,
   req->crc_compress = entry->crc_compress;//+++ 用于解压缩校验
   req->crc_uncompress = entry->crc_uncompress;//+++ 用于解压缩校验
   req->cqe.done = sswap_rdma_read_done;
+  req->start_time = ktime_get();
   ret = sswap_rdma_post_rdma(q, req, &sge, roffset, IB_WR_RDMA_READ);
 
   // sswap_rdma_wait_completion(q->cq, req);//等待read done完成 这里解压缩移到read_done中 不需要同步
 
-  //******** 解压缩 lzo **************
-  // decompress_buf_read_lzo(req);
 
-  // kmem_cache_free(req_cache, req);//不能提前释放
-  // kfree(req->src);
-  // SetPageUptodate(req->page);
-  // unlock_page(req->page);
   return ret;
 }
 
