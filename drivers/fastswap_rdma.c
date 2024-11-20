@@ -32,6 +32,10 @@ module_param_string(cip, clientip, INET_ADDRSTRLEN, 0644);
 #define CQ_NUM_CQES	(QP_MAX_SEND_WR)
 #define POLL_BATCH_HIGH (QP_MAX_SEND_WR / 4)
 
+static atomic64_t read_count = ATOMIC_INIT(0);
+static atomic64_t write_count = ATOMIC_INIT(0);
+static atomic64_t total_rdmaread_time = ATOMIC_INIT(0);
+
 static void sswap_rdma_addone(struct ib_device *dev)
 {
   pr_info("sswap_rdma_addone() = %s\n", dev->name);
@@ -424,6 +428,11 @@ static int sswap_rdma_create_ctrl(struct sswap_rdma_ctrl **c)
 
 static void __exit sswap_rdma_cleanup_module(void)
 {
+  pr_info("--------------------------------------");
+  pr_info("write count: %ld", atomic64_read(&write_count));
+  pr_info("read count: %ld total rdma read time: %ld", atomic64_read(&read_count), atomic64_read(&total_rdmaread_time));
+  pr_info("--------------------------------------");
+
   sswap_rdma_stopandfree_queues(gctrl);
   ib_unregister_client(&sswap_rdma_ib_client);
   kfree(gctrl);
@@ -456,9 +465,18 @@ static void sswap_rdma_read_done(struct ib_cq *cq, struct ib_wc *wc)
     container_of(wc->wr_cqe, struct rdma_req, cqe);
   struct rdma_queue *q = cq->cq_context;
   struct ib_device *ibdev = q->ctrl->rdev->dev;
+  ktime_t diff;
+
 
   if (unlikely(wc->status != IB_WC_SUCCESS))
     pr_err("sswap_rdma_read_done status is not success, it is=%d\n", wc->status);
+
+  diff = ktime_sub(ktime_get(), req->start_time);
+
+  //******** 统计 **************
+  atomic64_inc(&read_count);
+  atomic64_set(&total_rdmaread_time, atomic64_read(&total_rdmaread_time) + ktime_to_ns(diff));
+  
 
   ib_dma_unmap_page(ibdev, req->dma, PAGE_SIZE, DMA_FROM_DEVICE);
 
@@ -663,6 +681,9 @@ static inline int write_queue_add(struct rdma_queue *q, struct page *page,
     pr_info_ratelimited("back pressure writes");
   }
 
+  //******** 统计 **************
+  atomic64_inc(&write_count);
+
   ret = get_req_for_page(&req, dev, page, DMA_TO_DEVICE);
   if (unlikely(ret))
     return ret;
@@ -696,6 +717,7 @@ static inline int begin_read(struct rdma_queue *q, struct page *page,
     return ret;
 
   req->cqe.done = sswap_rdma_read_done;
+  req->start_time = ktime_get();
   ret = sswap_rdma_post_rdma(q, req, &sge, roffset, IB_WR_RDMA_READ);
   return ret;
 }

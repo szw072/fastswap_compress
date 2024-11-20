@@ -28,6 +28,7 @@ struct rdma_req {
   struct ib_cqe cqe;
   u64 dma;
   struct page *page;
+  ktime_t start_time;//++
 };
 
 struct sswap_rdma_ctrl;
